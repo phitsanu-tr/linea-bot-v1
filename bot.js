@@ -224,6 +224,14 @@ async function transferWithRetry(tokenAddress, amount) {
   }
   const { contract, decimals, symbol } = tokenInfo;
 
+// Check current balance before transfer
+  const currentBalance = await contract.balanceOf(wallet.address);
+  if (currentBalance.lt(amount)) {
+    log(`⚠️ Insufficient balance for ${symbol}: have ${ethers.utils.formatUnits(currentBalance, decimals)}, need ${ethers.utils.formatUnits(amount, decimals)}`);
+    tokenProcessing.set(tokenAddress, false);
+    return;
+  }
+
   if (!txQueue.nonce) {
     await txQueue.initNonce();
   }
