@@ -361,6 +361,7 @@ async function transferWithRetry(tokenAddress) {
       unsignedTx.gasLimit = gasEstimate.mul(120).div(100);
       unsignedTx.gasPrice = gasPrice;
       unsignedTx.nonce = nonce;
+      unsignedTx.chainId = await wallet.getChainId();
 
       const signedTx = await wallet.signTransaction(unsignedTx);
 
