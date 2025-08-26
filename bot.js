@@ -519,7 +519,7 @@ async function pollingBalances() {
 async function startPolling() {
   while (true) {
     await pollingBalances();
-    await delay(5000);
+    await delay(1000);
   }
 }
 
