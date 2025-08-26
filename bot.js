@@ -16,7 +16,7 @@ const WS_RPC_URLS = process.env.WS_RPC_URLS?.split(',').map(s => s.trim());
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const HEALTH_PORT = process.env.HEALTH_PORT || 3000;
-const DEBUG = process.env.DEBUG === 'true'; // Production debug control
+const DEBUG = process.env.DEBUG === 'true';
 
 if (!PRIVATE_KEY || !SAFE_WALLET || !WS_RPC_URLS || WS_RPC_URLS.length === 0) {
   console.error('Missing env variables: PRIVATE_KEY, SAFE_WALLET, WS_RPC_URLS');
@@ -31,12 +31,9 @@ if (!fs.existsSync(TOKENS_PATH)) {
 }
 const tokens = JSON.parse(fs.readFileSync(TOKENS_PATH, 'utf8'));
 
-// Performance caches
+// Performance caches (V8: Only safe caches)
 let CHAIN_ID = null;
-const GAS_ESTIMATES = new Map();
 const TRANSFER_DATA_CACHE = new Map();
-let cachedGasPrice = null;
-let gasPriceExpiry = 0;
 
 //
 // === HEALTH MONITORING ===
@@ -258,24 +255,6 @@ let multiProvider;
 const tokenContracts = new Map();
 const tokenProcessing = new Map();
 
-// Fast gas price with caching
-async function getGasPriceFast() {
-  if (Date.now() < gasPriceExpiry && cachedGasPrice) {
-    return cachedGasPrice;
-  }
-  
-  try {
-    cachedGasPrice = await multiProvider.currentProvider.getGasPrice();
-  } catch (err) {
-    cachedGasPrice = await multiProvider.callWithFallback(async (provider) => {
-      return await provider.getGasPrice();
-    });
-  }
-  
-  gasPriceExpiry = Date.now() + 5000; // Cache for 5 seconds
-  return cachedGasPrice;
-}
-
 async function cleanupContracts() {
   for (const [address, info] of tokenContracts) {
     info.contract.removeAllListeners('Transfer');
@@ -288,7 +267,7 @@ async function cleanupContracts() {
 async function setupContracts() {
   await cleanupContracts();
 
-  // Cache chain ID once
+  // Cache chain ID once (safe to cache)
   if (!CHAIN_ID) {
     CHAIN_ID = await wallet.getChainId();
     debugLog(`🔢 Cached chain ID: ${CHAIN_ID}`);
@@ -299,21 +278,15 @@ async function setupContracts() {
     tokenContracts.set(t.address.toLowerCase(), { contract, decimals: t.decimals, symbol: t.symbol });
     tokenProcessing.set(t.address.toLowerCase(), false);
 
-    // Cache gas estimate and transfer data
+    // Cache transfer function data (safe to cache - never changes)
     const addr = t.address.toLowerCase();
-    if (!GAS_ESTIMATES.has(addr)) {
+    if (!TRANSFER_DATA_CACHE.has(addr)) {
       try {
-        const dummyAmount = ethers.utils.parseUnits('1', t.decimals);
-        const gasEstimate = await contract.estimateGas.transfer(SAFE_WALLET, dummyAmount);
-        GAS_ESTIMATES.set(addr, gasEstimate.mul(120).div(100)); // Pre-calculate with buffer
-        
         const transferData = contract.interface.encodeFunctionData('transfer', [SAFE_WALLET, '0']);
         TRANSFER_DATA_CACHE.set(addr, transferData);
-        
-        debugLog(`💾 Cached gas estimate for ${t.symbol}: ${gasEstimate.toString()}`);
+        debugLog(`💾 Cached transfer data for ${t.symbol}`);
       } catch (err) {
-        debugLog(`⚠️ Failed to cache gas estimate for ${t.symbol}: ${err.message}`);
-        GAS_ESTIMATES.set(addr, ethers.BigNumber.from('100000')); // Fallback
+        debugLog(`⚠️ Failed to cache transfer data for ${t.symbol}: ${err.message}`);
       }
     }
 
@@ -324,7 +297,7 @@ async function setupContracts() {
       }
     });
   }
-  debugLog(`✅ Setup ${tokens.length} token contracts with cached data`);
+  debugLog(`✅ Setup ${tokens.length} token contracts`);
 }
 
 //
@@ -452,18 +425,32 @@ async function transferWithRetry(tokenAddress) {
     while (attempt < maxRetries) {
       attempt++;
       try {
-        // Use cached gas price
-        gasPrice = await getGasPriceFast();
+        // V8: Always get fresh gas price (no cache)
+        try {
+          gasPrice = await multiProvider.currentProvider.getGasPrice();
+        } catch (err) {
+          gasPrice = await multiProvider.callWithFallback(async (provider) => {
+            return await provider.getGasPrice();
+          });
+        }
         gasPrice = gasPrice.mul(120).div(100);
 
-        // Use cached gas estimate
-        const gasEstimate = GAS_ESTIMATES.get(addr) || ethers.BigNumber.from('100000');
+        // V8: Always estimate gas (no cache)
+        let gasEstimate;
+        try {
+          gasEstimate = await contract.estimateGas.transfer(SAFE_WALLET, currentBalance, { gasPrice, nonce });
+        } catch (err) {
+          gasEstimate = await multiProvider.callWithFallback(async (provider) => {
+            const contractWithProvider = new ethers.Contract(addr, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
+            return await contractWithProvider.estimateGas.transfer(SAFE_WALLET, currentBalance, { gasPrice, nonce });
+          });
+        }
 
         const unsignedTx = await contract.populateTransaction.transfer(SAFE_WALLET, currentBalance);
-        unsignedTx.gasLimit = gasEstimate;
+        unsignedTx.gasLimit = gasEstimate.mul(120).div(100);
         unsignedTx.gasPrice = gasPrice;
         unsignedTx.nonce = nonce;
-        unsignedTx.chainId = CHAIN_ID; // Use cached chain ID
+        unsignedTx.chainId = CHAIN_ID; // Use cached chain ID (safe)
 
         const signedTx = await wallet.signTransaction(unsignedTx);
 
@@ -563,7 +550,7 @@ async function pollingBalances() {
 async function startPolling() {
   while (true) {
     await pollingBalances();
-    await delay(1000);
+    await delay(1000); // V8: Back to 5 seconds (more reasonable)
   }
 }
 
@@ -607,9 +594,8 @@ function startHealthServer() {
       },
       cache: {
         chainId: CHAIN_ID,
-        gasEstimates: GAS_ESTIMATES.size,
-        gasPriceCached: cachedGasPrice !== null,
-        gasPriceExpiry: gasPriceExpiry
+        transferDataCached: TRANSFER_DATA_CACHE.size,
+        gasPolicy: 'real-time' // V8: No gas caching
       },
       debug: DEBUG,
       lastHeartbeat: metrics.lastHeartbeat
@@ -623,12 +609,6 @@ function startHealthServer() {
   app.get('/reset-locks', (req, res) => {
     resetProcessingLocks();
     res.json({ message: 'Processing locks reset', timestamp: Date.now() });
-  });
-
-  app.get('/clear-cache', (req, res) => {
-    cachedGasPrice = null;
-    gasPriceExpiry = 0;
-    res.json({ message: 'Gas price cache cleared', timestamp: Date.now() });
   });
 
   app.listen(HEALTH_PORT, () => {
@@ -647,12 +627,12 @@ function startHeartbeat() {
     
     const activeLocks = Array.from(tokenProcessing.entries()).filter(([_, v]) => v).length;
     
-    log(`💓 Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks} Cache=${GAS_ESTIMATES.size}`);
+    log(`💓 Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks}`);
     
     if (metrics.lastTxTime && Date.now() - metrics.lastTxTime > 300000) {
       log(`⚠️ No transactions for 5+ minutes`);
     }
-  }, 1000);
+  }, 1000); // V8: Back to 30 seconds (reasonable)
 }
 
 //
@@ -681,9 +661,9 @@ function startHeartbeat() {
   startHealthServer();
   startHeartbeat();
 
-  log(`🚀 Bot v7 started on wallet: ${wallet.address}`);
+  log(`🚀 Bot v8 started on wallet: ${wallet.address}`);
   log(`🏥 Health: http://localhost:${HEALTH_PORT}/health`);
-  log(`💾 Cached ${GAS_ESTIMATES.size} gas estimates, Chain ID: ${CHAIN_ID}`);
+  log(`⛽ Gas policy: Real-time (no caching), Chain ID: ${CHAIN_ID}`);
   if (DEBUG) log(`🔍 Debug mode enabled`);
 
   startPolling();
