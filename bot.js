@@ -627,7 +627,7 @@ function startHeartbeat() {
     
     const activeLocks = Array.from(tokenProcessing.entries()).filter(([_, v]) => v).length;
     
-    log(`💓 Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks}`);
+    log(`⏳ Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks}`);
     
     if (metrics.lastTxTime && Date.now() - metrics.lastTxTime > 300000) {
       log(`⚠️ No transactions for 5+ minutes`);
