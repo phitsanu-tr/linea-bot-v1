@@ -16,6 +16,7 @@ const WS_RPC_URLS = process.env.WS_RPC_URLS?.split(',').map(s => s.trim());
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const HEALTH_PORT = process.env.HEALTH_PORT || 3000;
+const DEBUG = process.env.DEBUG === 'true'; // Production debug control
 
 if (!PRIVATE_KEY || !SAFE_WALLET || !WS_RPC_URLS || WS_RPC_URLS.length === 0) {
   console.error('Missing env variables: PRIVATE_KEY, SAFE_WALLET, WS_RPC_URLS');
@@ -84,6 +85,10 @@ function log(...args) {
   metrics.lastHeartbeat = Date.now();
 }
 
+function debugLog(...args) {
+  if (DEBUG) log(...args);
+}
+
 function delay(ms) {
   return new Promise(res => setTimeout(res, ms));
 }
@@ -97,7 +102,7 @@ async function telegramNotify(message) {
       body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message })
     });
   } catch (e) {
-    log('Telegram notify failed:', e.message);
+    debugLog('Telegram notify failed:', e.message);
   }
 }
 
@@ -133,23 +138,22 @@ class MultiRpcProvider extends EventEmitter {
 
   async reconnectProvider(index) {
     if (this.reconnectAttempts[index] >= this.maxReconnectAttempts) {
-      log(`Max reconnect attempts reached for RPC #${index}`);
+      debugLog(`Max reconnect attempts reached for RPC #${index}`);
       return;
     }
 
     try {
-      log(`Reconnecting RPC #${index}...`);
+      debugLog(`Reconnecting RPC #${index}...`);
       this.providers[index] = new ethers.providers.WebSocketProvider(this.urls[index]);
       this.setupProviderListeners(index);
       this.reconnectAttempts[index] = 0;
       updateMetrics('reconnection');
-      log(`Successfully reconnected RPC #${index}`);
+      debugLog(`Successfully reconnected RPC #${index}`);
       
-      // Re-setup contracts after reconnection
       this.emit('reconnected', index);
     } catch (err) {
       this.reconnectAttempts[index]++;
-      log(`Failed to reconnect RPC #${index}, attempt ${this.reconnectAttempts[index]}: ${err.message}`);
+      debugLog(`Failed to reconnect RPC #${index}, attempt ${this.reconnectAttempts[index]}: ${err.message}`);
       setTimeout(() => this.reconnectProvider(index), 5000 * this.reconnectAttempts[index]);
     }
   }
@@ -179,7 +183,7 @@ class MultiRpcProvider extends EventEmitter {
       return;
     }
     this.currentIndex = this.latencies.indexOf(minLatency);
-    log(`Selected RPC #${this.currentIndex} (${this.urls[this.currentIndex]}) latency ${this.latencies[this.currentIndex]}ms`);
+    debugLog(`Selected RPC #${this.currentIndex} (${this.urls[this.currentIndex]}) latency ${this.latencies[this.currentIndex]}ms`);
     this.emit('providerChanged', this.currentProvider);
   }
 
@@ -190,13 +194,13 @@ class MultiRpcProvider extends EventEmitter {
   setupProviderListeners(index) {
     const p = this.providers[index];
     p._websocket.on('close', async (code) => {
-      log(`RPC #${index} websocket closed with code ${code}`);
+      debugLog(`RPC #${index} websocket closed with code ${code}`);
       await this.measureLatencies();
       this.selectBestProvider();
       this.reconnectProvider(index);
     });
     p._websocket.on('error', async (err) => {
-      log(`RPC #${index} websocket error: ${err.message}`);
+      debugLog(`RPC #${index} websocket error: ${err.message}`);
       updateMetrics('rpc_failure');
       await this.measureLatencies();
       this.selectBestProvider();
@@ -212,7 +216,7 @@ class MultiRpcProvider extends EventEmitter {
       try {
         return await fn(this.providers[i]);
       } catch (err) {
-        log(`RPC #${i} call failed: ${err.message}`);
+        debugLog(`RPC #${i} call failed: ${err.message}`);
         updateMetrics('rpc_failure');
         if (i === this.providers.length - 1) throw err;
       }
@@ -253,7 +257,7 @@ async function cleanupContracts() {
   }
   tokenContracts.clear();
   tokenProcessing.clear();
-  log('🧹 Cleaned up contracts and reset processing locks');
+  debugLog('🧹 Cleaned up contracts and reset processing locks');
 }
 
 async function setupContracts() {
@@ -266,13 +270,12 @@ async function setupContracts() {
 
     contract.on('Transfer', (from, to, value) => {
       if (to.toLowerCase() === wallet.address.toLowerCase()) {
-        log(`📥 Transfer event detected: ${t.symbol} from ${from}, amount: ${ethers.utils.formatUnits(value, t.decimals)}`);
-        log(`📥 Contract: ${t.address}, Processing status: ${tokenProcessing.get(t.address.toLowerCase())}`);
+        log(`📥 ${t.symbol} ${ethers.utils.formatUnits(value, t.decimals)} from ${from}`);
         enqueueTransfer(t.address);
       }
     });
   }
-  log(`✅ Setup ${tokens.length} token contracts with event listeners`);
+  debugLog(`✅ Setup ${tokens.length} token contracts with event listeners`);
 }
 
 //
@@ -288,12 +291,12 @@ class TxQueue {
 
   async initNonce() {
     this.nonce = await wallet.getTransactionCount('pending');
-    log(`🔢 Initialized nonce: ${this.nonce}`);
+    debugLog(`🔢 Initialized nonce: ${this.nonce}`);
   }
 
   enqueue(job) {
     this.queue.push(job);
-    log(`📋 Enqueued job: ${job.tokenAddress}, queue size: ${this.queue.length}`);
+    debugLog(`📋 Enqueued ${job.tokenAddress}, queue: ${this.queue.length}`);
     if (!this.processing) {
       this.process();
     }
@@ -301,16 +304,15 @@ class TxQueue {
 
   async process() {
     this.processing = true;
-    log(`🔄 Started processing queue with ${this.queue.length} jobs`);
+    debugLog(`🔄 Processing ${this.queue.length} jobs`);
     
     while (this.queue.length > 0) {
       const job = this.queue.shift();
-      log(`🔄 Processing job: ${job.tokenAddress}`);
       await transferWithRetry(job.tokenAddress);
     }
     
     this.processing = false;
-    log(`✅ Finished processing queue`);
+    debugLog(`✅ Queue finished`);
   }
 }
 
@@ -320,10 +322,8 @@ function enqueueTransfer(tokenAddress) {
   const addr = tokenAddress.toLowerCase();
   const isProcessing = tokenProcessing.get(addr);
   
-  log(`🔄 Enqueue ${addr}: processing=${isProcessing}, queue size=${txQueue.queue.length}`);
-  
   if (isProcessing) {
-    log(`⚠️ Already processing ${addr}, skipping enqueue`);
+    debugLog(`⚠️ ${addr} already processing, skipping`);
     return;
   }
   
@@ -359,12 +359,11 @@ async function transferWithRetry(tokenAddress) {
   const addr = tokenAddress.toLowerCase();
   
   if (tokenProcessing.get(addr)) {
-    log(`⚠️ ${addr} already processing, skipping`);
+    debugLog(`⚠️ ${addr} already processing, skipping`);
     return;
   }
   
   tokenProcessing.set(addr, true);
-  log(`🔒 Locked processing for ${addr}`);
 
   try {
     const tokenInfo = tokenContracts.get(addr);
@@ -374,21 +373,21 @@ async function transferWithRetry(tokenAddress) {
     }
     const { contract, decimals, symbol } = tokenInfo;
 
+    // Fast balance check - use current provider directly
     let currentBalance;
     try {
+      currentBalance = await contract.balanceOf(wallet.address);
+      debugLog(`💰 ${symbol}: ${ethers.utils.formatUnits(currentBalance, decimals)}`);
+    } catch (err) {
+      // Fallback to multi-provider only on error
       currentBalance = await multiProvider.callWithFallback(async (provider) => {
         const contractWithProvider = new ethers.Contract(addr, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
         return await contractWithProvider.balanceOf(wallet.address);
       });
-      log(`💰 Current balance for ${symbol}: ${ethers.utils.formatUnits(currentBalance, decimals)}`);
-    } catch (err) {
-      log(`❌ Failed to get balance for ${symbol}: ${err.message}`);
-      updateMetrics('transaction', false);
-      return;
     }
 
     if (currentBalance.lte(0)) {
-      log(`💸 No balance to transfer for ${symbol}`);
+      debugLog(`💸 No balance for ${symbol}`);
       return;
     }
 
@@ -404,9 +403,14 @@ async function transferWithRetry(tokenAddress) {
     while (attempt < maxRetries) {
       attempt++;
       try {
-        gasPrice = await multiProvider.callWithFallback(async (provider) => {
-          return await provider.getGasPrice();
-        });
+        // Fast gas price - use current provider first
+        try {
+          gasPrice = await multiProvider.currentProvider.getGasPrice();
+        } catch (err) {
+          gasPrice = await multiProvider.callWithFallback(async (provider) => {
+            return await provider.getGasPrice();
+          });
+        }
         gasPrice = gasPrice.mul(120).div(100);
 
         const gasEstimate = await contract.estimateGas.transfer(SAFE_WALLET, currentBalance, { gasPrice, nonce });
@@ -415,39 +419,43 @@ async function transferWithRetry(tokenAddress) {
         unsignedTx.gasLimit = gasEstimate.mul(120).div(100);
         unsignedTx.gasPrice = gasPrice;
         unsignedTx.nonce = nonce;
-        unsignedTx.chainId = await wallet.getChainId(); // FIX: Add chainId for EIP-155
+        unsignedTx.chainId = await wallet.getChainId();
 
         const signedTx = await wallet.signTransaction(unsignedTx);
 
-        const txResponse = await multiProvider.callWithFallback(async (provider) => {
-          return await provider.sendTransaction(signedTx);
-        });
+        // Fast send - use current provider first
+        let txResponse;
+        try {
+          txResponse = await multiProvider.currentProvider.sendTransaction(signedTx);
+        } catch (err) {
+          txResponse = await multiProvider.callWithFallback(async (provider) => {
+            return await provider.sendTransaction(signedTx);
+          });
+        }
 
-        log(`✅ Sent ${symbol} tx: ${txResponse.hash} attempt ${attempt} nonce ${nonce} gasPrice ${ethers.utils.formatUnits(gasPrice, 'gwei')} gwei`);
+        log(`✅ ${symbol} tx: ${txResponse.hash} (${ethers.utils.formatUnits(gasPrice, 'gwei')} gwei)`);
 
         await txResponse.wait(1);
 
-        log(`✅ Confirmed ${symbol} transfer tx: ${txResponse.hash}`);
+        log(`✅ Confirmed ${symbol}: ${txResponse.hash}`);
 
         nonce++;
         txQueue.nonce = nonce;
         updateMetrics('transaction', true);
 
-        await telegramNotify(`✅ Transfer success: ${symbol} ${ethers.utils.formatUnits(currentBalance, decimals)} TX: ${txResponse.hash}`);
+        await telegramNotify(`✅ ${symbol} ${ethers.utils.formatUnits(currentBalance, decimals)} TX: ${txResponse.hash}`);
 
         return true;
       } catch (err) {
-        log(`⚠️ Transfer attempt ${attempt} failed for ${symbol}: ${err.message}`);
+        debugLog(`⚠️ ${symbol} attempt ${attempt} failed: ${err.message}`);
 
         if (err.message.includes('nonce too low')) {
           nonce = await wallet.getTransactionCount('pending');
           txQueue.nonce = nonce;
-          log(`🔢 Updated nonce to ${nonce}`);
         } else if (err.message.includes('replacement transaction underpriced')) {
           gasPrice = gasPrice.mul(110).div(100);
-          log(`⛽ Increased gas price to ${ethers.utils.formatUnits(gasPrice, 'gwei')} gwei`);
         } else if (err.message.includes('insufficient funds')) {
-          log(`❌ Insufficient funds to send gas fee!`);
+          log(`❌ Insufficient funds for gas!`);
           await telegramNotify(`❌ Insufficient funds for gas!`);
           updateMetrics('transaction', false);
           return false;
@@ -461,20 +469,19 @@ async function transferWithRetry(tokenAddress) {
       }
     }
     
-    log(`❌ Failed to transfer ${symbol} after ${maxRetries} attempts`);
+    log(`❌ Failed ${symbol} after ${maxRetries} attempts`);
     updateMetrics('transaction', false);
     
     if (metrics.consecutiveFailures >= 5) {
-      await telegramNotify(`🚨 ALERT: ${metrics.consecutiveFailures} consecutive transaction failures!`);
+      await telegramNotify(`🚨 ALERT: ${metrics.consecutiveFailures} consecutive failures!`);
     }
     
-    await telegramNotify(`❌ Failed to transfer ${symbol} after ${maxRetries} attempts`);
+    await telegramNotify(`❌ Failed ${symbol} after ${maxRetries} attempts`);
     return false;
     
   } finally {
-    // FIX: Always unlock processing in finally block
     tokenProcessing.set(addr, false);
-    log(`🔓 Unlocked processing for ${addr}`);
+    debugLog(`🔓 Unlocked ${addr}`);
   }
 }
 
@@ -488,17 +495,23 @@ async function pollingBalances() {
       const tokenInfo = tokenContracts.get(t.address.toLowerCase());
       if (!tokenInfo) continue;
 
-      const balance = await multiProvider.callWithFallback(async (provider) => {
-        const contractWithProvider = new ethers.Contract(t.address, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
-        return await contractWithProvider.balanceOf(wallet.address);
-      });
+      // Fast polling - use current provider first
+      let balance;
+      try {
+        balance = await tokenInfo.contract.balanceOf(wallet.address);
+      } catch (err) {
+        balance = await multiProvider.callWithFallback(async (provider) => {
+          const contractWithProvider = new ethers.Contract(t.address, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
+          return await contractWithProvider.balanceOf(wallet.address);
+        });
+      }
 
       if (balance.gt(0)) {
-        log(`⌚ Poll detected ${tokenInfo.symbol} balance: ${ethers.utils.formatUnits(balance, tokenInfo.decimals)}`);
+        debugLog(`⌚ Poll: ${tokenInfo.symbol} ${ethers.utils.formatUnits(balance, tokenInfo.decimals)}`);
         enqueueTransfer(t.address);
       }
     } catch (err) {
-      log(`Polling error for ${t.symbol}: ${err.message}`);
+      debugLog(`Polling error for ${t.symbol}: ${err.message}`);
     }
   }
 }
@@ -548,6 +561,7 @@ function startHealthServer() {
         locks: Array.from(tokenProcessing.entries()).filter(([_, v]) => v).map(([k, _]) => k),
         lockResets: metrics.processingLockResets
       },
+      debug: DEBUG,
       lastHeartbeat: metrics.lastHeartbeat
     });
   });
@@ -577,7 +591,7 @@ function startHeartbeat() {
     
     const activeLocks = Array.from(tokenProcessing.entries()).filter(([_, v]) => v).length;
     
-    log(`💓 Heartbeat: Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% (${metrics.successfulTx}/${metrics.totalTransactions}) Locks=${activeLocks}`);
+    log(`💓 Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks}`);
     
     if (metrics.lastTxTime && Date.now() - metrics.lastTxTime > 300000) {
       log(`⚠️ No transactions for 5+ minutes`);
@@ -593,14 +607,14 @@ function startHeartbeat() {
   multiProvider = new MultiRpcProvider(WS_RPC_URLS);
 
   multiProvider.on('providerChanged', async (newProvider) => {
-    log(`Provider switched to: ${newProvider.connection.url}`);
+    debugLog(`Provider switched to: ${newProvider.connection.url}`);
     wallet = new ethers.Wallet(PRIVATE_KEY, newProvider);
     await setupContracts();
     txQueue.nonce = null;
   });
 
   multiProvider.on('reconnected', async (index) => {
-    log(`RPC #${index} reconnected, re-setting up contracts...`);
+    debugLog(`RPC #${index} reconnected, re-setting up contracts...`);
     await setupContracts();
   });
 
@@ -612,8 +626,8 @@ function startHeartbeat() {
   startHeartbeat();
 
   log(`🚀 Bot started on wallet: ${wallet.address}`);
-  log(`🏥 Health endpoint: http://localhost:${HEALTH_PORT}/health`);
-  log(`🔓 Reset locks endpoint: http://localhost:${HEALTH_PORT}/reset-locks`);
+  log(`🏥 Health: http://localhost:${HEALTH_PORT}/health`);
+  if (DEBUG) log(`🔍 Debug mode enabled`);
 
   startPolling();
 
