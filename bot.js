@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { EventEmitter } from 'events';
 import fetch from 'node-fetch';
-import express from 'express'; // For health monitoring
+import express from 'express';
 
 //
 // === CONFIG SECTION ===
@@ -43,7 +43,8 @@ const metrics = {
   lastHeartbeat: Date.now(),
   rpcFailures: 0,
   wsReconnections: 0,
-  consecutiveFailures: 0
+  consecutiveFailures: 0,
+  processingLockResets: 0
 };
 
 function updateMetrics(type, success = true) {
@@ -64,6 +65,9 @@ function updateMetrics(type, success = true) {
       break;
     case 'reconnection':
       metrics.wsReconnections++;
+      break;
+    case 'lock_reset':
+      metrics.processingLockResets++;
       break;
   }
 }
@@ -140,6 +144,9 @@ class MultiRpcProvider extends EventEmitter {
       this.reconnectAttempts[index] = 0;
       updateMetrics('reconnection');
       log(`Successfully reconnected RPC #${index}`);
+      
+      // Re-setup contracts after reconnection
+      this.emit('reconnected', index);
     } catch (err) {
       this.reconnectAttempts[index]++;
       log(`Failed to reconnect RPC #${index}, attempt ${this.reconnectAttempts[index]}: ${err.message}`);
@@ -246,6 +253,7 @@ async function cleanupContracts() {
   }
   tokenContracts.clear();
   tokenProcessing.clear();
+  log('🧹 Cleaned up contracts and reset processing locks');
 }
 
 async function setupContracts() {
@@ -259,10 +267,12 @@ async function setupContracts() {
     contract.on('Transfer', (from, to, value) => {
       if (to.toLowerCase() === wallet.address.toLowerCase()) {
         log(`📥 Transfer event detected: ${t.symbol} from ${from}, amount: ${ethers.utils.formatUnits(value, t.decimals)}`);
+        log(`📥 Contract: ${t.address}, Processing status: ${tokenProcessing.get(t.address.toLowerCase())}`);
         enqueueTransfer(t.address);
       }
     });
   }
+  log(`✅ Setup ${tokens.length} token contracts with event listeners`);
 }
 
 //
@@ -278,10 +288,12 @@ class TxQueue {
 
   async initNonce() {
     this.nonce = await wallet.getTransactionCount('pending');
+    log(`🔢 Initialized nonce: ${this.nonce}`);
   }
 
   enqueue(job) {
     this.queue.push(job);
+    log(`📋 Enqueued job: ${job.tokenAddress}, queue size: ${this.queue.length}`);
     if (!this.processing) {
       this.process();
     }
@@ -289,134 +301,181 @@ class TxQueue {
 
   async process() {
     this.processing = true;
+    log(`🔄 Started processing queue with ${this.queue.length} jobs`);
+    
     while (this.queue.length > 0) {
       const job = this.queue.shift();
+      log(`🔄 Processing job: ${job.tokenAddress}`);
       await transferWithRetry(job.tokenAddress);
     }
+    
     this.processing = false;
+    log(`✅ Finished processing queue`);
   }
 }
 
 const txQueue = new TxQueue();
 
 function enqueueTransfer(tokenAddress) {
-  txQueue.enqueue({ tokenAddress: tokenAddress.toLowerCase() });
+  const addr = tokenAddress.toLowerCase();
+  const isProcessing = tokenProcessing.get(addr);
+  
+  log(`🔄 Enqueue ${addr}: processing=${isProcessing}, queue size=${txQueue.queue.length}`);
+  
+  if (isProcessing) {
+    log(`⚠️ Already processing ${addr}, skipping enqueue`);
+    return;
+  }
+  
+  txQueue.enqueue({ tokenAddress: addr });
 }
+
+//
+// === PROCESSING LOCK MANAGEMENT ===
+//
+
+function resetProcessingLocks() {
+  let resetCount = 0;
+  for (const [address, isProcessing] of tokenProcessing) {
+    if (isProcessing) {
+      tokenProcessing.set(address, false);
+      resetCount++;
+    }
+  }
+  if (resetCount > 0) {
+    log(`🔓 Reset ${resetCount} stuck processing locks`);
+    updateMetrics('lock_reset');
+  }
+}
+
+// Reset stuck locks every 5 minutes
+setInterval(resetProcessingLocks, 300000);
 
 //
 // === TRANSFER WITH RETRY + ERROR RECOVERY ===
 //
 
 async function transferWithRetry(tokenAddress) {
-  if (tokenProcessing.get(tokenAddress)) return;
-  tokenProcessing.set(tokenAddress, true);
-
-  const tokenInfo = tokenContracts.get(tokenAddress);
-  if (!tokenInfo) {
-    log(`Token contract not found for ${tokenAddress}`);
-    tokenProcessing.set(tokenAddress, false);
+  const addr = tokenAddress.toLowerCase();
+  
+  if (tokenProcessing.get(addr)) {
+    log(`⚠️ ${addr} already processing, skipping`);
     return;
   }
-  const { contract, decimals, symbol } = tokenInfo;
+  
+  tokenProcessing.set(addr, true);
+  log(`🔒 Locked processing for ${addr}`);
 
-  let currentBalance;
   try {
-    currentBalance = await multiProvider.callWithFallback(async (provider) => {
-      const contractWithProvider = new ethers.Contract(tokenAddress, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
-      return await contractWithProvider.balanceOf(wallet.address);
-    });
-  } catch (err) {
-    log(`Failed to get balance for ${symbol}: ${err.message}`);
-    updateMetrics('transaction', false);
-    tokenProcessing.set(tokenAddress, false);
-    return;
-  }
-
-  if (currentBalance.lte(0)) {
-    log(`No balance to transfer for ${symbol}`);
-    tokenProcessing.set(tokenAddress, false);
-    return;
-  }
-
-  if (!txQueue.nonce) {
-    await txQueue.initNonce();
-  }
-
-  let gasPrice;
-  let nonce = txQueue.nonce;
-  const maxRetries = 5;
-  let attempt = 0;
-
-  while (attempt < maxRetries) {
-    attempt++;
-    try {
-      gasPrice = await multiProvider.callWithFallback(async (provider) => {
-        return await provider.getGasPrice();
-      });
-      gasPrice = gasPrice.mul(120).div(100);
-
-      const gasEstimate = await contract.estimateGas.transfer(SAFE_WALLET, currentBalance, { gasPrice, nonce });
-
-      const unsignedTx = await contract.populateTransaction.transfer(SAFE_WALLET, currentBalance);
-      unsignedTx.gasLimit = gasEstimate.mul(120).div(100);
-      unsignedTx.gasPrice = gasPrice;
-      unsignedTx.nonce = nonce;
-      unsignedTx.chainId = await wallet.getChainId();
-
-      const signedTx = await wallet.signTransaction(unsignedTx);
-
-      const txResponse = await multiProvider.callWithFallback(async (provider) => {
-        return await provider.sendTransaction(signedTx);
-      });
-
-      log(`✅ Sent ${symbol} tx: ${txResponse.hash} attempt ${attempt} nonce ${nonce} gasPrice ${ethers.utils.formatUnits(gasPrice, 'gwei')} gwei`);
-
-      await txResponse.wait(1);
-
-      log(`✅ Confirmed ${symbol} transfer tx: ${txResponse.hash}`);
-
-      nonce++;
-      txQueue.nonce = nonce;
-      tokenProcessing.set(tokenAddress, false);
-      updateMetrics('transaction', true);
-
-      await telegramNotify(`✅ Transfer success: ${symbol} ${ethers.utils.formatUnits(currentBalance, decimals)} TX: ${txResponse.hash}`);
-
-      return true;
-    } catch (err) {
-      log(`⚠️ Transfer attempt ${attempt} failed for ${symbol}: ${err.message}`);
-
-      if (err.message.includes('nonce too low')) {
-        nonce = await wallet.getTransactionCount('pending');
-        txQueue.nonce = nonce;
-      } else if (err.message.includes('replacement transaction underpriced')) {
-        gasPrice = gasPrice.mul(110).div(100);
-      } else if (err.message.includes('insufficient funds')) {
-        log(`❌ Insufficient funds to send gas fee!`);
-        await telegramNotify(`❌ Insufficient funds for gas!`);
-        tokenProcessing.set(tokenAddress, false);
-        updateMetrics('transaction', false);
-        return false;
-      }
-
-      gasPrice = gasPrice.mul(110).div(100);
-      nonce++;
-      txQueue.nonce = nonce;
-
-      await delay(2 ** attempt * 1000);
+    const tokenInfo = tokenContracts.get(addr);
+    if (!tokenInfo) {
+      log(`❌ Token contract not found for ${addr}`);
+      return;
     }
+    const { contract, decimals, symbol } = tokenInfo;
+
+    let currentBalance;
+    try {
+      currentBalance = await multiProvider.callWithFallback(async (provider) => {
+        const contractWithProvider = new ethers.Contract(addr, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
+        return await contractWithProvider.balanceOf(wallet.address);
+      });
+      log(`💰 Current balance for ${symbol}: ${ethers.utils.formatUnits(currentBalance, decimals)}`);
+    } catch (err) {
+      log(`❌ Failed to get balance for ${symbol}: ${err.message}`);
+      updateMetrics('transaction', false);
+      return;
+    }
+
+    if (currentBalance.lte(0)) {
+      log(`💸 No balance to transfer for ${symbol}`);
+      return;
+    }
+
+    if (!txQueue.nonce) {
+      await txQueue.initNonce();
+    }
+
+    let gasPrice;
+    let nonce = txQueue.nonce;
+    const maxRetries = 5;
+    let attempt = 0;
+
+    while (attempt < maxRetries) {
+      attempt++;
+      try {
+        gasPrice = await multiProvider.callWithFallback(async (provider) => {
+          return await provider.getGasPrice();
+        });
+        gasPrice = gasPrice.mul(120).div(100);
+
+        const gasEstimate = await contract.estimateGas.transfer(SAFE_WALLET, currentBalance, { gasPrice, nonce });
+
+        const unsignedTx = await contract.populateTransaction.transfer(SAFE_WALLET, currentBalance);
+        unsignedTx.gasLimit = gasEstimate.mul(120).div(100);
+        unsignedTx.gasPrice = gasPrice;
+        unsignedTx.nonce = nonce;
+        unsignedTx.chainId = await wallet.getChainId(); // FIX: Add chainId for EIP-155
+
+        const signedTx = await wallet.signTransaction(unsignedTx);
+
+        const txResponse = await multiProvider.callWithFallback(async (provider) => {
+          return await provider.sendTransaction(signedTx);
+        });
+
+        log(`✅ Sent ${symbol} tx: ${txResponse.hash} attempt ${attempt} nonce ${nonce} gasPrice ${ethers.utils.formatUnits(gasPrice, 'gwei')} gwei`);
+
+        await txResponse.wait(1);
+
+        log(`✅ Confirmed ${symbol} transfer tx: ${txResponse.hash}`);
+
+        nonce++;
+        txQueue.nonce = nonce;
+        updateMetrics('transaction', true);
+
+        await telegramNotify(`✅ Transfer success: ${symbol} ${ethers.utils.formatUnits(currentBalance, decimals)} TX: ${txResponse.hash}`);
+
+        return true;
+      } catch (err) {
+        log(`⚠️ Transfer attempt ${attempt} failed for ${symbol}: ${err.message}`);
+
+        if (err.message.includes('nonce too low')) {
+          nonce = await wallet.getTransactionCount('pending');
+          txQueue.nonce = nonce;
+          log(`🔢 Updated nonce to ${nonce}`);
+        } else if (err.message.includes('replacement transaction underpriced')) {
+          gasPrice = gasPrice.mul(110).div(100);
+          log(`⛽ Increased gas price to ${ethers.utils.formatUnits(gasPrice, 'gwei')} gwei`);
+        } else if (err.message.includes('insufficient funds')) {
+          log(`❌ Insufficient funds to send gas fee!`);
+          await telegramNotify(`❌ Insufficient funds for gas!`);
+          updateMetrics('transaction', false);
+          return false;
+        }
+
+        gasPrice = gasPrice.mul(110).div(100);
+        nonce++;
+        txQueue.nonce = nonce;
+
+        await delay(2 ** attempt * 1000);
+      }
+    }
+    
+    log(`❌ Failed to transfer ${symbol} after ${maxRetries} attempts`);
+    updateMetrics('transaction', false);
+    
+    if (metrics.consecutiveFailures >= 5) {
+      await telegramNotify(`🚨 ALERT: ${metrics.consecutiveFailures} consecutive transaction failures!`);
+    }
+    
+    await telegramNotify(`❌ Failed to transfer ${symbol} after ${maxRetries} attempts`);
+    return false;
+    
+  } finally {
+    // FIX: Always unlock processing in finally block
+    tokenProcessing.set(addr, false);
+    log(`🔓 Unlocked processing for ${addr}`);
   }
-  log(`❌ Failed to transfer ${symbol} after ${maxRetries} attempts`);
-  tokenProcessing.set(tokenAddress, false);
-  updateMetrics('transaction', false);
-  
-  // Alert on consecutive failures
-  if (metrics.consecutiveFailures >= 5) {
-    await telegramNotify(`🚨 ALERT: ${metrics.consecutiveFailures} consecutive transaction failures!`);
-  }
-  
-  await telegramNotify(`❌ Failed to transfer ${symbol} after ${maxRetries} attempts`);
-  return false;
 }
 
 //
@@ -485,12 +544,21 @@ function startHealthServer() {
         size: txQueue.queue.length,
         processing: txQueue.processing
       },
+      processing: {
+        locks: Array.from(tokenProcessing.entries()).filter(([_, v]) => v).map(([k, _]) => k),
+        lockResets: metrics.processingLockResets
+      },
       lastHeartbeat: metrics.lastHeartbeat
     });
   });
 
   app.get('/metrics', (req, res) => {
     res.json(metrics);
+  });
+
+  app.get('/reset-locks', (req, res) => {
+    resetProcessingLocks();
+    res.json({ message: 'Processing locks reset', timestamp: Date.now() });
   });
 
   app.listen(HEALTH_PORT, () => {
@@ -507,10 +575,11 @@ function startHeartbeat() {
     const successRate = metrics.totalTransactions > 0 ? 
       (metrics.successfulTx / metrics.totalTransactions * 100).toFixed(1) : 0;
     
-    log(`💓 Heartbeat: Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% (${metrics.successfulTx}/${metrics.totalTransactions})`);
+    const activeLocks = Array.from(tokenProcessing.entries()).filter(([_, v]) => v).length;
     
-    // Alert if no activity for too long
-    if (metrics.lastTxTime && Date.now() - metrics.lastTxTime > 300000) { // 5 minutes
+    log(`💓 Heartbeat: Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% (${metrics.successfulTx}/${metrics.totalTransactions}) Locks=${activeLocks}`);
+    
+    if (metrics.lastTxTime && Date.now() - metrics.lastTxTime > 300000) {
       log(`⚠️ No transactions for 5+ minutes`);
     }
   }, 30000);
@@ -530,16 +599,21 @@ function startHeartbeat() {
     txQueue.nonce = null;
   });
 
+  multiProvider.on('reconnected', async (index) => {
+    log(`RPC #${index} reconnected, re-setting up contracts...`);
+    await setupContracts();
+  });
+
   wallet = new ethers.Wallet(PRIVATE_KEY, multiProvider.currentProvider);
   await setupContracts();
   await txQueue.initNonce();
 
-  // Start health monitoring
   startHealthServer();
   startHeartbeat();
 
   log(`🚀 Bot started on wallet: ${wallet.address}`);
   log(`🏥 Health endpoint: http://localhost:${HEALTH_PORT}/health`);
+  log(`🔓 Reset locks endpoint: http://localhost:${HEALTH_PORT}/reset-locks`);
 
   startPolling();
 
