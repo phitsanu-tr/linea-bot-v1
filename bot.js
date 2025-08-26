@@ -596,7 +596,7 @@ function startHeartbeat() {
     if (metrics.lastTxTime && Date.now() - metrics.lastTxTime > 300000) {
       log(`⚠️ No transactions for 5+ minutes`);
     }
-  }, 30000);
+  }, 1000);
 }
 
 //
