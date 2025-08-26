@@ -31,9 +31,10 @@ if (!fs.existsSync(TOKENS_PATH)) {
 }
 const tokens = JSON.parse(fs.readFileSync(TOKENS_PATH, 'utf8'));
 
-// Performance caches (V8: Only safe caches)
+// Ultra performance caches
 let CHAIN_ID = null;
 const TRANSFER_DATA_CACHE = new Map();
+const PROCESSED_EVENTS = new Set(); // Prevent duplicate processing
 
 //
 // === HEALTH MONITORING ===
@@ -49,7 +50,8 @@ const metrics = {
   rpcFailures: 0,
   wsReconnections: 0,
   consecutiveFailures: 0,
-  processingLockResets: 0
+  processingLockResets: 0,
+  skippedDuplicates: 0
 };
 
 function updateMetrics(type, success = true) {
@@ -73,6 +75,9 @@ function updateMetrics(type, success = true) {
       break;
     case 'lock_reset':
       metrics.processingLockResets++;
+      break;
+    case 'duplicate_skip':
+      metrics.skippedDuplicates++;
       break;
   }
 }
@@ -261,6 +266,7 @@ async function cleanupContracts() {
   }
   tokenContracts.clear();
   tokenProcessing.clear();
+  PROCESSED_EVENTS.clear();
   debugLog('🧹 Cleaned up contracts and reset processing locks');
 }
 
@@ -290,10 +296,18 @@ async function setupContracts() {
       }
     }
 
-    contract.on('Transfer', (from, to, value) => {
+    contract.on('Transfer', (from, to, value, event) => {
       if (to.toLowerCase() === wallet.address.toLowerCase()) {
+        // Ultra-fast duplicate prevention
+        const eventId = `${event.transactionHash}-${event.logIndex}`;
+        if (PROCESSED_EVENTS.has(eventId)) {
+          updateMetrics('duplicate_skip');
+          return;
+        }
+        PROCESSED_EVENTS.add(eventId);
+        
         log(`📥 ${t.symbol} ${ethers.utils.formatUnits(value, t.decimals)} from ${from}`);
-        enqueueTransfer(t.address);
+        enqueueTransfer(t.address, value); // Pass amount for ultra speed
       }
     });
   }
@@ -330,7 +344,7 @@ class TxQueue {
     
     while (this.queue.length > 0) {
       const job = this.queue.shift();
-      await transferWithRetry(job.tokenAddress);
+      await transferWithRetry(job.tokenAddress, job.amount);
     }
     
     this.processing = false;
@@ -340,7 +354,7 @@ class TxQueue {
 
 const txQueue = new TxQueue();
 
-function enqueueTransfer(tokenAddress) {
+function enqueueTransfer(tokenAddress, amount) {
   const addr = tokenAddress.toLowerCase();
   const isProcessing = tokenProcessing.get(addr);
   
@@ -349,7 +363,7 @@ function enqueueTransfer(tokenAddress) {
     return;
   }
   
-  txQueue.enqueue({ tokenAddress: addr });
+  txQueue.enqueue({ tokenAddress: addr, amount }); // Pass amount for speed
 }
 
 //
@@ -374,10 +388,10 @@ function resetProcessingLocks() {
 setInterval(resetProcessingLocks, 300000);
 
 //
-// === TRANSFER WITH RETRY + ERROR RECOVERY ===
+// === ULTRA-FAST TRANSFER WITH RETRY ===
 //
 
-async function transferWithRetry(tokenAddress) {
+async function transferWithRetry(tokenAddress, amount) {
   const addr = tokenAddress.toLowerCase();
   
   if (tokenProcessing.get(addr)) {
@@ -395,23 +409,9 @@ async function transferWithRetry(tokenAddress) {
     }
     const { contract, decimals, symbol } = tokenInfo;
 
-    // Fast balance check - use current provider directly
-    let currentBalance;
-    try {
-      currentBalance = await contract.balanceOf(wallet.address);
-      debugLog(`💰 ${symbol}: ${ethers.utils.formatUnits(currentBalance, decimals)}`);
-    } catch (err) {
-      // Fallback to multi-provider only on error
-      currentBalance = await multiProvider.callWithFallback(async (provider) => {
-        const contractWithProvider = new ethers.Contract(addr, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
-        return await contractWithProvider.balanceOf(wallet.address);
-      });
-    }
-
-    if (currentBalance.lte(0)) {
-      debugLog(`💸 No balance for ${symbol}`);
-      return;
-    }
+    // V9: NO BALANCE CHECK - Use amount from event directly for max speed
+    const currentBalance = amount;
+    debugLog(`💰 ${symbol}: ${ethers.utils.formatUnits(currentBalance, decimals)} (from event)`);
 
     if (!txQueue.nonce) {
       await txQueue.initNonce();
@@ -419,42 +419,49 @@ async function transferWithRetry(tokenAddress) {
 
     let gasPrice;
     let nonce = txQueue.nonce;
-    const maxRetries = 5;
+    const maxRetries = 3; // Reduced retries for speed
     let attempt = 0;
 
     while (attempt < maxRetries) {
       attempt++;
       try {
-        // V8: Always get fresh gas price (no cache)
-        try {
-          gasPrice = await multiProvider.currentProvider.getGasPrice();
-        } catch (err) {
-          gasPrice = await multiProvider.callWithFallback(async (provider) => {
-            return await provider.getGasPrice();
-          });
-        }
-        gasPrice = gasPrice.mul(120).div(100);
+        // V9: Parallel gas operations for max speed
+        const [gasPriceResult, gasEstimateResult] = await Promise.all([
+          // Gas price
+          (async () => {
+            try {
+              return await multiProvider.currentProvider.getGasPrice();
+            } catch (err) {
+              return await multiProvider.callWithFallback(async (provider) => {
+                return await provider.getGasPrice();
+              });
+            }
+          })(),
+          // Gas estimate
+          (async () => {
+            try {
+              return await contract.estimateGas.transfer(SAFE_WALLET, currentBalance, { nonce });
+            } catch (err) {
+              return await multiProvider.callWithFallback(async (provider) => {
+                const contractWithProvider = new ethers.Contract(addr, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
+                return await contractWithProvider.estimateGas.transfer(SAFE_WALLET, currentBalance, { nonce });
+              });
+            }
+          })()
+        ]);
 
-        // V8: Always estimate gas (no cache)
-        let gasEstimate;
-        try {
-          gasEstimate = await contract.estimateGas.transfer(SAFE_WALLET, currentBalance, { gasPrice, nonce });
-        } catch (err) {
-          gasEstimate = await multiProvider.callWithFallback(async (provider) => {
-            const contractWithProvider = new ethers.Contract(addr, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
-            return await contractWithProvider.estimateGas.transfer(SAFE_WALLET, currentBalance, { gasPrice, nonce });
-          });
-        }
+        gasPrice = gasPriceResult.mul(120).div(100);
+        const gasEstimate = gasEstimateResult.mul(120).div(100);
 
         const unsignedTx = await contract.populateTransaction.transfer(SAFE_WALLET, currentBalance);
-        unsignedTx.gasLimit = gasEstimate.mul(120).div(100);
+        unsignedTx.gasLimit = gasEstimate;
         unsignedTx.gasPrice = gasPrice;
         unsignedTx.nonce = nonce;
-        unsignedTx.chainId = CHAIN_ID; // Use cached chain ID (safe)
+        unsignedTx.chainId = CHAIN_ID; // Use cached chain ID
 
         const signedTx = await wallet.signTransaction(unsignedTx);
 
-        // Fast send - use current provider first
+        // Ultra-fast send - use current provider first
         let txResponse;
         try {
           txResponse = await multiProvider.currentProvider.sendTransaction(signedTx);
@@ -466,9 +473,8 @@ async function transferWithRetry(tokenAddress) {
 
         log(`✅ ${symbol} tx: ${txResponse.hash} (${ethers.utils.formatUnits(gasPrice, 'gwei')} gwei)`);
 
-        await txResponse.wait(1);
-
-        log(`✅ Confirmed ${symbol}: ${txResponse.hash}`);
+        // V9: Don't wait for confirmation for max speed (fire and forget)
+        // await txResponse.wait(1);
 
         nonce++;
         txQueue.nonce = nonce;
@@ -496,7 +502,7 @@ async function transferWithRetry(tokenAddress) {
         nonce++;
         txQueue.nonce = nonce;
 
-        await delay(2 ** attempt * 1000);
+        await delay(1000); // Reduced delay for speed
       }
     }
     
@@ -517,16 +523,20 @@ async function transferWithRetry(tokenAddress) {
 }
 
 //
-// === POLLING BALANCES ===
+// === MINIMAL POLLING (BACKUP ONLY) ===
 //
 
 async function pollingBalances() {
+  // V9: Minimal polling - only check if no recent activity
+  if (metrics.lastTxTime && Date.now() - metrics.lastTxTime < 1000) {
+    return; // Skip if recent activity
+  }
+
   for (const t of tokens) {
     try {
       const tokenInfo = tokenContracts.get(t.address.toLowerCase());
       if (!tokenInfo) continue;
 
-      // Fast polling - use current provider first
       let balance;
       try {
         balance = await tokenInfo.contract.balanceOf(wallet.address);
@@ -539,7 +549,7 @@ async function pollingBalances() {
 
       if (balance.gt(0)) {
         debugLog(`⌚ Poll: ${tokenInfo.symbol} ${ethers.utils.formatUnits(balance, tokenInfo.decimals)}`);
-        enqueueTransfer(t.address);
+        enqueueTransfer(t.address, balance);
       }
     } catch (err) {
       debugLog(`Polling error for ${t.symbol}: ${err.message}`);
@@ -550,7 +560,7 @@ async function pollingBalances() {
 async function startPolling() {
   while (true) {
     await pollingBalances();
-    await delay(1000); // V8: Back to 5 seconds (more reasonable)
+    await delay(1000); // V9: Slower polling, rely on events
   }
 }
 
@@ -592,10 +602,12 @@ function startHealthServer() {
         locks: Array.from(tokenProcessing.entries()).filter(([_, v]) => v).map(([k, _]) => k),
         lockResets: metrics.processingLockResets
       },
-      cache: {
+      performance: {
         chainId: CHAIN_ID,
         transferDataCached: TRANSFER_DATA_CACHE.size,
-        gasPolicy: 'real-time' // V8: No gas caching
+        processedEvents: PROCESSED_EVENTS.size,
+        skippedDuplicates: metrics.skippedDuplicates,
+        mode: 'ultra-speed'
       },
       debug: DEBUG,
       lastHeartbeat: metrics.lastHeartbeat
@@ -609,6 +621,11 @@ function startHealthServer() {
   app.get('/reset-locks', (req, res) => {
     resetProcessingLocks();
     res.json({ message: 'Processing locks reset', timestamp: Date.now() });
+  });
+
+  app.get('/clear-events', (req, res) => {
+    PROCESSED_EVENTS.clear();
+    res.json({ message: 'Event cache cleared', timestamp: Date.now() });
   });
 
   app.listen(HEALTH_PORT, () => {
@@ -627,12 +644,12 @@ function startHeartbeat() {
     
     const activeLocks = Array.from(tokenProcessing.entries()).filter(([_, v]) => v).length;
     
-    log(`⏳ Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks}`);
+    log(`💀 Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks} Events=${PROCESSED_EVENTS.size}`);
     
     if (metrics.lastTxTime && Date.now() - metrics.lastTxTime > 300000) {
       log(`⚠️ No transactions for 5+ minutes`);
     }
-  }, 1000); // V8: Back to 30 seconds (reasonable)
+  }, 1000);
 }
 
 //
@@ -661,9 +678,9 @@ function startHeartbeat() {
   startHealthServer();
   startHeartbeat();
 
-  log(`🚀 Bot v8 started on wallet: ${wallet.address}`);
+  log(`🚀 Bot v9 ULTRA-SPEED started on wallet: ${wallet.address}`);
   log(`🏥 Health: http://localhost:${HEALTH_PORT}/health`);
-  log(`⛽ Gas policy: Real-time (no caching), Chain ID: ${CHAIN_ID}`);
+  log(`⚡ Mode: Ultra-speed (no balance check, parallel ops, fire-and-forget)`);
   if (DEBUG) log(`🔍 Debug mode enabled`);
 
   startPolling();
