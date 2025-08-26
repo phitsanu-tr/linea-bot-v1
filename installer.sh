@@ -13,8 +13,8 @@ BLUE='\e[1;34m'
 RESET='\e[0m'
 
 # Configurable variables
-BOT_REPO_URL="https://github.com/phitsanu-tr/linea-bot.git"   # <<< CHANGE THIS
-BOT_DIR="linea-bot"
+BOT_REPO_URL="https://github.com/phitsanu-tr/linea-bot-v1.git"   # <<< CHANGE THIS
+BOT_DIR="linea-bot-v1"
 
 # === [1/7] Update System Packages ===
 echo -e "\n${BLUE}🧰 [1/7] Updating system packages...${RESET}\n"
@@ -53,7 +53,7 @@ npm install
 # === [7/7] Install PM2 and Start Bot ===
 echo -e "\n${BLUE}🧰 [7/7] Installing PM2 and starting bot...${RESET}\n"
 sudo npm install -g pm2@latest
-pm2 start bot.js --name linea-bot
+pm2 start bot.js --name linea-bot-v1
 pm2 save
 pm2 startup | tail -n 1 | bash
 
@@ -64,9 +64,9 @@ echo ""
 echo -e "${YELLOW}📘 PM2 Basic Commands:${RESET}"
 echo "   pm2 ls                   # Show running processes"
 echo "   pm2 logs                 # Show live logs"
-echo "   pm2 restart linea-bot    # Restart the bot"
-echo "   pm2 stop linea-bot       # Stop the bot"
-echo "   pm2 delete linea-bot     # Remove the bot from PM2"
+echo "   pm2 restart linea-bot-v1 # Restart the bot"
+echo "   pm2 stop linea-bot-v1    # Stop the bot"
+echo "   pm2 delete linea-bot-v1  # Remove the bot from PM2"
 echo "   pm2 save                 # Save the current process list (auto-start on boot)"
 echo "   pm2 startup              # Generate startup script for auto-start on reboot"
 echo ""

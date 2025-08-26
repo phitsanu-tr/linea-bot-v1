@@ -1,5 +1,5 @@
 {
-  "name": "linea-bot",
+  "name": "linea-bot-v1",
   "version": "1.0.0",
   "description": "Auto transfer ERC-20 tokens on Linea",
   "main": "bot.js",
