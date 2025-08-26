@@ -17,6 +17,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const HEALTH_PORT = process.env.HEALTH_PORT || 3000;
 const DEBUG = process.env.DEBUG === 'true';
+const ULTRA_MODE = process.env.ULTRA_MODE === 'true'; // V10: Configurable speed mode
 
 if (!PRIVATE_KEY || !SAFE_WALLET || !WS_RPC_URLS || WS_RPC_URLS.length === 0) {
   console.error('Missing env variables: PRIVATE_KEY, SAFE_WALLET, WS_RPC_URLS');
@@ -31,10 +32,12 @@ if (!fs.existsSync(TOKENS_PATH)) {
 }
 const tokens = JSON.parse(fs.readFileSync(TOKENS_PATH, 'utf8'));
 
-// Ultra performance caches
+// Performance caches (V10: Best of both worlds)
 let CHAIN_ID = null;
 const TRANSFER_DATA_CACHE = new Map();
-const PROCESSED_EVENTS = new Set(); // Prevent duplicate processing
+const PROCESSED_EVENTS = new Set();
+const BALANCE_CACHE = new Map();
+let balanceCacheExpiry = 0;
 
 //
 // === HEALTH MONITORING ===
@@ -51,7 +54,8 @@ const metrics = {
   wsReconnections: 0,
   consecutiveFailures: 0,
   processingLockResets: 0,
-  skippedDuplicates: 0
+  skippedDuplicates: 0,
+  balanceChecksSaved: 0
 };
 
 function updateMetrics(type, success = true) {
@@ -78,6 +82,9 @@ function updateMetrics(type, success = true) {
       break;
     case 'duplicate_skip':
       metrics.skippedDuplicates++;
+      break;
+    case 'balance_saved':
+      metrics.balanceChecksSaved++;
       break;
   }
 }
@@ -260,6 +267,43 @@ let multiProvider;
 const tokenContracts = new Map();
 const tokenProcessing = new Map();
 
+// V10: Smart balance checking
+async function getBalanceSmart(contract, addr, symbol, decimals, eventAmount = null) {
+  // Ultra mode: use event amount directly
+  if (ULTRA_MODE && eventAmount) {
+    updateMetrics('balance_saved');
+    debugLog(`💰 ${symbol}: ${ethers.utils.formatUnits(eventAmount, decimals)} (from event)`);
+    return eventAmount;
+  }
+
+  // Check cache first (1 second cache)
+  const cacheKey = addr;
+  if (Date.now() < balanceCacheExpiry && BALANCE_CACHE.has(cacheKey)) {
+    const cachedBalance = BALANCE_CACHE.get(cacheKey);
+    updateMetrics('balance_saved');
+    debugLog(`💰 ${symbol}: ${ethers.utils.formatUnits(cachedBalance, decimals)} (cached)`);
+    return cachedBalance;
+  }
+
+  // Fresh balance check
+  let balance;
+  try {
+    balance = await contract.balanceOf(wallet.address);
+  } catch (err) {
+    balance = await multiProvider.callWithFallback(async (provider) => {
+      const contractWithProvider = new ethers.Contract(addr, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
+      return await contractWithProvider.balanceOf(wallet.address);
+    });
+  }
+
+  // Cache the result
+  BALANCE_CACHE.set(cacheKey, balance);
+  balanceCacheExpiry = Date.now() + 1000; // 1 second cache
+
+  debugLog(`💰 ${symbol}: ${ethers.utils.formatUnits(balance, decimals)} (fresh)`);
+  return balance;
+}
+
 async function cleanupContracts() {
   for (const [address, info] of tokenContracts) {
     info.contract.removeAllListeners('Transfer');
@@ -267,6 +311,7 @@ async function cleanupContracts() {
   tokenContracts.clear();
   tokenProcessing.clear();
   PROCESSED_EVENTS.clear();
+  BALANCE_CACHE.clear();
   debugLog('🧹 Cleaned up contracts and reset processing locks');
 }
 
@@ -298,7 +343,7 @@ async function setupContracts() {
 
     contract.on('Transfer', (from, to, value, event) => {
       if (to.toLowerCase() === wallet.address.toLowerCase()) {
-        // Ultra-fast duplicate prevention
+        // V10: Advanced duplicate prevention (from V9)
         const eventId = `${event.transactionHash}-${event.logIndex}`;
         if (PROCESSED_EVENTS.has(eventId)) {
           updateMetrics('duplicate_skip');
@@ -307,7 +352,7 @@ async function setupContracts() {
         PROCESSED_EVENTS.add(eventId);
         
         log(`📥 ${t.symbol} ${ethers.utils.formatUnits(value, t.decimals)} from ${from}`);
-        enqueueTransfer(t.address, value); // Pass amount for ultra speed
+        enqueueTransfer(t.address, value); // Pass amount for smart balance
       }
     });
   }
@@ -363,7 +408,7 @@ function enqueueTransfer(tokenAddress, amount) {
     return;
   }
   
-  txQueue.enqueue({ tokenAddress: addr, amount }); // Pass amount for speed
+  txQueue.enqueue({ tokenAddress: addr, amount });
 }
 
 //
@@ -388,10 +433,10 @@ function resetProcessingLocks() {
 setInterval(resetProcessingLocks, 300000);
 
 //
-// === ULTRA-FAST TRANSFER WITH RETRY ===
+// === V10: HYBRID TRANSFER WITH SMART OPTIMIZATIONS ===
 //
 
-async function transferWithRetry(tokenAddress, amount) {
+async function transferWithRetry(tokenAddress, eventAmount) {
   const addr = tokenAddress.toLowerCase();
   
   if (tokenProcessing.get(addr)) {
@@ -409,9 +454,13 @@ async function transferWithRetry(tokenAddress, amount) {
     }
     const { contract, decimals, symbol } = tokenInfo;
 
-    // V9: NO BALANCE CHECK - Use amount from event directly for max speed
-    const currentBalance = amount;
-    debugLog(`💰 ${symbol}: ${ethers.utils.formatUnits(currentBalance, decimals)} (from event)`);
+    // V10: Smart balance check (best of V8 + V9)
+    const currentBalance = await getBalanceSmart(contract, addr, symbol, decimals, eventAmount);
+
+    if (currentBalance.lte(0)) {
+      debugLog(`💸 No balance for ${symbol}`);
+      return;
+    }
 
     if (!txQueue.nonce) {
       await txQueue.initNonce();
@@ -419,13 +468,13 @@ async function transferWithRetry(tokenAddress, amount) {
 
     let gasPrice;
     let nonce = txQueue.nonce;
-    const maxRetries = 3; // Reduced retries for speed
+    const maxRetries = ULTRA_MODE ? 3 : 5; // V10: Configurable retries
     let attempt = 0;
 
     while (attempt < maxRetries) {
       attempt++;
       try {
-        // V9: Parallel gas operations for max speed
+        // V10: Parallel gas operations (from V9) for speed
         const [gasPriceResult, gasEstimateResult] = await Promise.all([
           // Gas price
           (async () => {
@@ -461,7 +510,7 @@ async function transferWithRetry(tokenAddress, amount) {
 
         const signedTx = await wallet.signTransaction(unsignedTx);
 
-        // Ultra-fast send - use current provider first
+        // Fast send - use current provider first
         let txResponse;
         try {
           txResponse = await multiProvider.currentProvider.sendTransaction(signedTx);
@@ -473,8 +522,12 @@ async function transferWithRetry(tokenAddress, amount) {
 
         log(`✅ ${symbol} tx: ${txResponse.hash} (${ethers.utils.formatUnits(gasPrice, 'gwei')} gwei)`);
 
-        // V9: Don't wait for confirmation for max speed (fire and forget)
-        // await txResponse.wait(1);
+        // V10: Configurable confirmation wait
+        if (!ULTRA_MODE) {
+          await txResponse.wait(1); // V8 behavior: wait for confirmation
+          log(`✅ Confirmed ${symbol}: ${txResponse.hash}`);
+        }
+        // Ultra mode: fire-and-forget (V9 behavior)
 
         nonce++;
         txQueue.nonce = nonce;
@@ -502,7 +555,8 @@ async function transferWithRetry(tokenAddress, amount) {
         nonce++;
         txQueue.nonce = nonce;
 
-        await delay(1000); // Reduced delay for speed
+        const delayTime = ULTRA_MODE ? 1000 : (2 ** attempt * 1000);
+        await delay(delayTime);
       }
     }
     
@@ -523,13 +577,13 @@ async function transferWithRetry(tokenAddress, amount) {
 }
 
 //
-// === MINIMAL POLLING (BACKUP ONLY) ===
+// === POLLING BALANCES ===
 //
 
 async function pollingBalances() {
-  // V9: Minimal polling - only check if no recent activity
-  if (metrics.lastTxTime && Date.now() - metrics.lastTxTime < 1000) {
-    return; // Skip if recent activity
+  // V10: Smart polling - skip if recent activity and ultra mode
+  if (ULTRA_MODE && metrics.lastTxTime && Date.now() - metrics.lastTxTime < 10000) {
+    return;
   }
 
   for (const t of tokens) {
@@ -537,15 +591,7 @@ async function pollingBalances() {
       const tokenInfo = tokenContracts.get(t.address.toLowerCase());
       if (!tokenInfo) continue;
 
-      let balance;
-      try {
-        balance = await tokenInfo.contract.balanceOf(wallet.address);
-      } catch (err) {
-        balance = await multiProvider.callWithFallback(async (provider) => {
-          const contractWithProvider = new ethers.Contract(t.address, ERC20_ABI, new ethers.Wallet(PRIVATE_KEY, provider));
-          return await contractWithProvider.balanceOf(wallet.address);
-        });
-      }
+      const balance = await getBalanceSmart(tokenInfo.contract, t.address.toLowerCase(), t.symbol, t.decimals);
 
       if (balance.gt(0)) {
         debugLog(`⌚ Poll: ${tokenInfo.symbol} ${ethers.utils.formatUnits(balance, tokenInfo.decimals)}`);
@@ -558,9 +604,10 @@ async function pollingBalances() {
 }
 
 async function startPolling() {
+  const pollingInterval = ULTRA_MODE ? 5000 : 1000; // V10: Configurable polling
   while (true) {
     await pollingBalances();
-    await delay(1000); // V9: Slower polling, rely on events
+    await delay(pollingInterval);
   }
 }
 
@@ -603,11 +650,13 @@ function startHealthServer() {
         lockResets: metrics.processingLockResets
       },
       performance: {
+        mode: ULTRA_MODE ? 'ultra-speed' : 'balanced',
         chainId: CHAIN_ID,
         transferDataCached: TRANSFER_DATA_CACHE.size,
         processedEvents: PROCESSED_EVENTS.size,
         skippedDuplicates: metrics.skippedDuplicates,
-        mode: 'ultra-speed'
+        balanceChecksSaved: metrics.balanceChecksSaved,
+        balanceCacheSize: BALANCE_CACHE.size
       },
       debug: DEBUG,
       lastHeartbeat: metrics.lastHeartbeat
@@ -623,9 +672,20 @@ function startHealthServer() {
     res.json({ message: 'Processing locks reset', timestamp: Date.now() });
   });
 
-  app.get('/clear-events', (req, res) => {
+  app.get('/clear-cache', (req, res) => {
     PROCESSED_EVENTS.clear();
-    res.json({ message: 'Event cache cleared', timestamp: Date.now() });
+    BALANCE_CACHE.clear();
+    balanceCacheExpiry = 0;
+    res.json({ message: 'All caches cleared', timestamp: Date.now() });
+  });
+
+  app.get('/toggle-mode', (req, res) => {
+    // Note: This would require restart to take effect properly
+    res.json({ 
+      message: 'Mode toggle endpoint (restart required)', 
+      currentMode: ULTRA_MODE ? 'ultra-speed' : 'balanced',
+      timestamp: Date.now() 
+    });
   });
 
   app.listen(HEALTH_PORT, () => {
@@ -643,8 +703,9 @@ function startHeartbeat() {
       (metrics.successfulTx / metrics.totalTransactions * 100).toFixed(1) : 0;
     
     const activeLocks = Array.from(tokenProcessing.entries()).filter(([_, v]) => v).length;
+    const mode = ULTRA_MODE ? 'ULTRA' : 'BAL';
     
-    log(`💀 Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks} Events=${PROCESSED_EVENTS.size}`);
+    log(`💀 Queue=${txQueue.queue.length} RPC=#${multiProvider.currentIndex} Success=${successRate}% Locks=${activeLocks} Mode=${mode} Saved=${metrics.balanceChecksSaved}`);
     
     if (metrics.lastTxTime && Date.now() - metrics.lastTxTime > 300000) {
       log(`⚠️ No transactions for 5+ minutes`);
@@ -678,9 +739,10 @@ function startHeartbeat() {
   startHealthServer();
   startHeartbeat();
 
-  log(`🚀 Bot v9 ULTRA-SPEED started on wallet: ${wallet.address}`);
+  const mode = ULTRA_MODE ? 'ULTRA-SPEED' : 'BALANCED';
+  log(`🚀 Bot v10 ${mode} started on wallet: ${wallet.address}`);
   log(`🏥 Health: http://localhost:${HEALTH_PORT}/health`);
-  log(`⚡ Mode: Ultra-speed (no balance check, parallel ops, fire-and-forget)`);
+  log(`⚖️ Mode: ${mode} (ULTRA_MODE=${ULTRA_MODE})`);
   if (DEBUG) log(`🔍 Debug mode enabled`);
 
   startPolling();
