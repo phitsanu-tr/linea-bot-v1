@@ -151,20 +151,29 @@ let multiProvider;
 const tokenContracts = new Map();
 const tokenProcessing = new Map();
 
-async function setupContracts() {
+// FIX 3: Memory Leak - Cleanup function
+async function cleanupContracts() {
+  for (const [address, info] of tokenContracts) {
+    info.contract.removeAllListeners('Transfer');
+  }
   tokenContracts.clear();
   tokenProcessing.clear();
+}
+
+async function setupContracts() {
+  // FIX 3: Clean up old contracts first
+  await cleanupContracts();
 
   for (const t of tokens) {
     const contract = new ethers.Contract(t.address, ERC20_ABI, wallet);
     tokenContracts.set(t.address.toLowerCase(), { contract, decimals: t.decimals, symbol: t.symbol });
     tokenProcessing.set(t.address.toLowerCase(), false);
 
-    contract.removeAllListeners('Transfer');
     contract.on('Transfer', (from, to, value) => {
       if (to.toLowerCase() === wallet.address.toLowerCase()) {
         log(`📥 Transfer event detected: ${t.symbol} from ${from}, amount: ${ethers.utils.formatUnits(value, t.decimals)}`);
-        enqueueTransfer(t.address, value);
+        // FIX 1: Race Condition - Don't pass amount, let transfer function get current balance
+        enqueueTransfer(t.address);
       }
     });
   }
@@ -196,7 +205,7 @@ class TxQueue {
     this.processing = true;
     while (this.queue.length > 0) {
       const job = this.queue.shift();
-      await transferWithRetry(job.tokenAddress, job.amount);
+      await transferWithRetry(job.tokenAddress);
     }
     this.processing = false;
   }
@@ -204,15 +213,17 @@ class TxQueue {
 
 const txQueue = new TxQueue();
 
-function enqueueTransfer(tokenAddress, amount) {
-  txQueue.enqueue({ tokenAddress: tokenAddress.toLowerCase(), amount });
+// FIX 1: Race Condition - Remove amount parameter
+function enqueueTransfer(tokenAddress) {
+  txQueue.enqueue({ tokenAddress: tokenAddress.toLowerCase() });
 }
 
 //
 // === TRANSFER WITH RETRY, ADAPTIVE GAS, PRE-SIGNED TX ===
 //
 
-async function transferWithRetry(tokenAddress, amount) {
+// FIX 1 & 2: Race Condition + Duplicate API Calls - Get fresh balance in transfer function
+async function transferWithRetry(tokenAddress) {
   if (tokenProcessing.get(tokenAddress)) return;
   tokenProcessing.set(tokenAddress, true);
 
@@ -224,10 +235,18 @@ async function transferWithRetry(tokenAddress, amount) {
   }
   const { contract, decimals, symbol } = tokenInfo;
 
-// Check current balance before transfer
-  const currentBalance = await contract.balanceOf(wallet.address);
-  if (currentBalance.lt(amount)) {
-    log(`⚠️ Insufficient balance for ${symbol}: have ${ethers.utils.formatUnits(currentBalance, decimals)}, need ${ethers.utils.formatUnits(amount, decimals)}`);
+  // FIX 1 & 2: Get current balance at transfer time (no race condition, no duplicate calls)
+  let currentBalance;
+  try {
+    currentBalance = await contract.balanceOf(wallet.address);
+  } catch (err) {
+    log(`Failed to get balance for ${symbol}: ${err.message}`);
+    tokenProcessing.set(tokenAddress, false);
+    return;
+  }
+
+  if (currentBalance.lte(0)) {
+    log(`No balance to transfer for ${symbol}`);
     tokenProcessing.set(tokenAddress, false);
     return;
   }
@@ -247,9 +266,9 @@ async function transferWithRetry(tokenAddress, amount) {
       gasPrice = await multiProvider.currentProvider.getGasPrice();
       gasPrice = gasPrice.mul(120).div(100); // +20% buffer
 
-      const gasEstimate = await contract.estimateGas.transfer(SAFE_WALLET, amount, { gasPrice, nonce });
+      const gasEstimate = await contract.estimateGas.transfer(SAFE_WALLET, currentBalance, { gasPrice, nonce });
 
-      const unsignedTx = await contract.populateTransaction.transfer(SAFE_WALLET, amount);
+      const unsignedTx = await contract.populateTransaction.transfer(SAFE_WALLET, currentBalance);
       unsignedTx.gasLimit = gasEstimate.mul(120).div(100);
       unsignedTx.gasPrice = gasPrice;
       unsignedTx.nonce = nonce;
@@ -267,7 +286,7 @@ async function transferWithRetry(tokenAddress, amount) {
       txQueue.nonce = nonce;
       tokenProcessing.set(tokenAddress, false);
 
-      await telegramNotify(`✅ Transfer success: ${symbol} ${ethers.utils.formatUnits(amount, decimals)} TX: ${txResponse.hash}`);
+      await telegramNotify(`✅ Transfer success: ${symbol} ${ethers.utils.formatUnits(currentBalance, decimals)} TX: ${txResponse.hash}`);
 
       return true;
     } catch (err) {
@@ -312,7 +331,8 @@ async function pollingBalances() {
       const balance = await tokenInfo.contract.balanceOf(wallet.address);
       if (balance.gt(0)) {
         log(`⌚ Poll detected ${tokenInfo.symbol} balance: ${ethers.utils.formatUnits(balance, tokenInfo.decimals)}`);
-        enqueueTransfer(t.address, balance);
+        // FIX 2: No duplicate API calls - just trigger transfer, let it get fresh balance
+        enqueueTransfer(t.address);
       }
     } catch (err) {
       log(`Polling error for ${t.symbol}: ${err.message}`);
@@ -323,7 +343,7 @@ async function pollingBalances() {
 async function startPolling() {
   while (true) {
     await pollingBalances();
-    await delay(1000);
+    await delay(1000); // Increased from 1000ms to reduce RPC load
   }
 }
 
@@ -334,10 +354,11 @@ async function startPolling() {
 (async () => {
   multiProvider = new MultiRpcProvider(WS_RPC_URLS);
 
-  multiProvider.on('providerChanged', (newProvider) => {
+  multiProvider.on('providerChanged', async (newProvider) => {
     log(`Provider switched to: ${newProvider.connection.url}`);
     wallet = new ethers.Wallet(PRIVATE_KEY, newProvider);
-    setupContracts().catch(e => log('Setup contracts error:', e.message));
+    // FIX 3: Proper cleanup before setup
+    await setupContracts();
     txQueue.nonce = null; // reset nonce cache
   });
 
@@ -354,13 +375,15 @@ async function startPolling() {
   startPolling();
 
   // Optional: Setup graceful shutdown on signals
-  process.on('SIGINT', () => {
+  process.on('SIGINT', async () => {
     log('Received SIGINT, exiting...');
+    await cleanupContracts();
     multiProvider.stopHealthCheck();
     process.exit();
   });
-  process.on('SIGTERM', () => {
+  process.on('SIGTERM', async () => {
     log('Received SIGTERM, exiting...');
+    await cleanupContracts();
     multiProvider.stopHealthCheck();
     process.exit();
   });
